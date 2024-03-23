@@ -25,7 +25,8 @@ MapFileDescriptor INVALID_MAPFILE = { -1, NULL };
 
 LPVOID fmalloced_base = nullptr;
 std::vector<MapFileDescriptor> descriptors;
-HANDLE view_handle;
+HANDLE view_handle = NULL;
+HANDLE exception_handler = NULL;
 
 static O1HeapInstance* instance = NULL;
 
@@ -76,6 +77,7 @@ int fallocate(HANDLE hndl, long long int size_to_reserve)
 }
 
 void nemory_mapping_init(const char* files_prefix, size_t size);
+void nemory_mapping_deinit();
 
 /* init routine */
 void fmalloc_init(const char* filepath, size_t max_size)
@@ -96,6 +98,12 @@ void *fmalloc(size_t size)
 void ffree(void *addr)
 {
 	o1heapFree(instance, addr);
+}
+
+XBOXFMALLOC_API void  fmalloc_close()
+{
+	instance = nullptr;
+	nemory_mapping_deinit();
 }
 
 MapFileDescriptor open_map_file(const char* filepath, size_t max_size)
@@ -221,5 +229,23 @@ void nemory_mapping_init(const char* files_prefix, size_t size)
 		nullptr, 0
 	);
 
-	AddVectoredExceptionHandler(TRUE, &ShadowExceptionHandler);
+	exception_handler = AddVectoredExceptionHandler(TRUE, &ShadowExceptionHandler);
+}
+
+void nemory_mapping_deinit()
+{
+	RemoveVectoredExceptionHandler(exception_handler);
+	exception_handler = NULL;
+
+	UnmapViewOfFile2(GetCurrentProcess(), view_handle, MEM_PRESERVE_PLACEHOLDER);
+	view_handle = NULL;
+
+	size_t pages = descriptors.size();
+	VirtualFree(fmalloced_base, 0, MEM_RELEASE);
+	fmalloced_base = nullptr;
+
+	for (auto& descriptor : descriptors)
+	{
+		close_map_file(descriptor);
+	}
 }
