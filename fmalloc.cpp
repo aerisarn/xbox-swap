@@ -30,6 +30,9 @@ HANDLE view_handle2;
 size_t next_replace = 0;
 HANDLE exception_handler = NULL;
 
+CRITICAL_SECTION memory_critical_section; 
+
+
 static O1HeapInstance* instance = NULL;
 
 #ifdef __USE_FILE_OFFSET64
@@ -90,22 +93,42 @@ void fmalloc_init(const char* filepath, size_t max_size)
 	{
 		return;
 	}
+       
+        if (!InitializeCriticalSectionAndSpinCount(&memory_critical_section,
+                                                   0x00000400)) {
+                return;
+        }
 }
 
 void *fmalloc(size_t size)
 {
-	return o1heapAllocate(instance, size);
+        EnterCriticalSection(&memory_critical_section);    // no time-out interval
+	void* result = o1heapAllocate(instance, size);
+        LeaveCriticalSection(&memory_critical_section);
+        return result;
 }
 
 void ffree(void *addr)
 {
-	o1heapFree(instance, addr);
+        EnterCriticalSection(&memory_critical_section); // no time-out interval
+   o1heapFree(instance, addr);
+        LeaveCriticalSection(&memory_critical_section);
+}
+
+void* frealloc(void *_Block, size_t _Size) {
+   EnterCriticalSection(&memory_critical_section); // no time-out interval
+   void *new_alloc = fmalloc(_Size);
+   memcpy(new_alloc, _Block, _Size);
+   ffree(_Block);
+   LeaveCriticalSection(&memory_critical_section);
+   return new_alloc;
 }
 
 XBOXFMALLOC_API void  fmalloc_close()
 {
 	instance = nullptr;
 	nemory_mapping_deinit();
+        DeleteCriticalSection(&memory_critical_section);
 }
 
 MapFileDescriptor open_map_file(const char* filepath, size_t max_size)
@@ -171,6 +194,8 @@ ShadowExceptionHandler(PEXCEPTION_POINTERS exception_pointers) {
 
         HANDLE &unload_handle = next_replace ? view_handle2 : view_handle1;
 
+        VirtualLock(unload_handle, MAPFILE_SIZE);
+
 	UnmapViewOfFile2(GetCurrentProcess(), unload_handle,
                          MEM_PRESERVE_PLACEHOLDER);
 
@@ -183,6 +208,8 @@ ShadowExceptionHandler(PEXCEPTION_POINTERS exception_pointers) {
 		MEM_REPLACE_PLACEHOLDER,
 		PAGE_READWRITE,
 		nullptr, 0);
+
+        VirtualUnlock(unload_handle, MAPFILE_SIZE);
 
         next_replace = next_replace ? 0 : 1;
 

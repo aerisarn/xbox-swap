@@ -15,6 +15,7 @@ extern "C" {
 
 	XBOXFMALLOC_API void  fmalloc_init(const char* filepath, size_t max_size);
 	XBOXFMALLOC_API void* fmalloc(size_t size);
+        XBOXFMALLOC_API void* frealloc(void *_Block, size_t _Size);
 	XBOXFMALLOC_API void  ffree(void* addr);
 	XBOXFMALLOC_API void  fmalloc_close();
 
