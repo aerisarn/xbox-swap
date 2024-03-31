@@ -13,6 +13,19 @@
 #include <vector>
 #include <string>
 
+#ifdef _XBOX_UWP
+extern "C" {
+WINBASEAPI
+_Ret_maybenull_ PVOID WINAPI AddVectoredExceptionHandler(
+    _In_ ULONG First, _In_ PVECTORED_EXCEPTION_HANDLER Handler);
+
+WINBASEAPI
+ULONG
+WINAPI
+RemoveVectoredExceptionHandler(_In_ PVOID Handle);
+}
+#endif
+
 #define MAPFILE_SIZE 536870912ull
 
 struct MapFileDescriptor
@@ -181,6 +194,18 @@ void close_map_file(MapFileDescriptor map_file)
 	_close(map_file.file_descriptor);
 }
 
+#ifdef _XBOX_UWP
+#define MapFile MapViewOfFile3FromApp
+#else
+#define MapFile MapViewOfFile3
+#endif
+
+#ifdef _XBOX_UWP
+#define VAlloc VirtualAlloc2FromApp
+#else
+#define VAlloc VirtualAlloc2
+#endif
+
 //THE SHADOW!
 static LONG CALLBACK
 ShadowExceptionHandler(PEXCEPTION_POINTERS exception_pointers) {
@@ -194,12 +219,12 @@ ShadowExceptionHandler(PEXCEPTION_POINTERS exception_pointers) {
 
         HANDLE &unload_handle = next_replace ? view_handle2 : view_handle1;
 
-        VirtualLock(unload_handle, MAPFILE_SIZE);
+        //VirtualLock(unload_handle, MAPFILE_SIZE);
 
 	UnmapViewOfFile2(GetCurrentProcess(), unload_handle,
                          MEM_PRESERVE_PLACEHOLDER);
 
-	unload_handle = MapViewOfFile3(
+	unload_handle = MapFile(
 		descriptors.at(file_index).mapping_handle,
 		nullptr,
 		(char*)fmalloced_base + file_index * MAPFILE_SIZE,
@@ -209,13 +234,12 @@ ShadowExceptionHandler(PEXCEPTION_POINTERS exception_pointers) {
 		PAGE_READWRITE,
 		nullptr, 0);
 
-        VirtualUnlock(unload_handle, MAPFILE_SIZE);
+        //VirtualUnlock(unload_handle, MAPFILE_SIZE);
 
         next_replace = next_replace ? 0 : 1;
 
 	return EXCEPTION_CONTINUE_EXECUTION;
 }
-
 
 void nemory_mapping_init(const char* files_prefix, size_t size)
 {
@@ -229,7 +253,7 @@ void nemory_mapping_init(const char* files_prefix, size_t size)
 	}
 
 	//allocate the whole address space
-	fmalloced_base = VirtualAlloc2(
+	fmalloced_base = VAlloc(
 		nullptr,
 		nullptr,
 		pages * MAPFILE_SIZE,
@@ -254,11 +278,12 @@ void nemory_mapping_init(const char* files_prefix, size_t size)
 
 	//load first page
         // load first two page
-        view_handle1 = MapViewOfFile3(
+        view_handle1 = MapFile(
             descriptors.at(0).mapping_handle, nullptr, fmalloced_base, 0,
             MAPFILE_SIZE, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
 
-        view_handle2 = MapViewOfFile3(descriptors.at(1).mapping_handle, nullptr,
+        view_handle2 =
+            MapFile(descriptors.at(1).mapping_handle, nullptr,
                                       (char *)fmalloced_base + MAPFILE_SIZE, 0,
                                       MAPFILE_SIZE, MEM_REPLACE_PLACEHOLDER,
                                       PAGE_READWRITE, nullptr, 0);
@@ -268,7 +293,8 @@ void nemory_mapping_init(const char* files_prefix, size_t size)
 
 void nemory_mapping_deinit()
 {
-	RemoveVectoredExceptionHandler(exception_handler);
+        RemoveVectoredExceptionHandler(exception_handler);
+
 	exception_handler = NULL;
 
 	UnmapViewOfFile2(GetCurrentProcess(), view_handle1, MEM_PRESERVE_PLACEHOLDER);
