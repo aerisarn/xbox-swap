@@ -26,6 +26,18 @@ RemoveVectoredExceptionHandler(_In_ PVOID Handle);
 }
 #endif
 
+#ifdef _XBOX_UWP
+#define MapFile MapViewOfFile3FromApp
+#else
+#define MapFile MapViewOfFile3
+#endif
+
+#ifdef _XBOX_UWP
+#define VAlloc VirtualAlloc2FromApp
+#else
+#define VAlloc VirtualAlloc2
+#endif
+
 #if ULONG_MAX / 2 < LONG_MAX
 #error `unsigned long` too narrow.  Need new approach.
 #endif
@@ -35,19 +47,15 @@ unsigned long distance(long x, long y) {
                  : (unsigned long)y - (unsigned long)x;
 }
 
-#define MAPFILE_MAX_LOADED_BYTES 1073741824ull
-#define MAPFILE_PAGE_SIZE 65536
+#define MAPFILE_MAX_LOADED_BYTES 536870912
+#define MAPFILE_PAGE_SIZE 4096
 
-struct MapFileDescriptor {
-  int file_descriptor;
-  HANDLE mapping_handle;
-};
-
-MapFileDescriptor INVALID_MAPFILE = {-1, NULL};
+HANDLE INVALID_MAPFILE = NULL;
 
 LPVOID fmalloced_base = nullptr;
-MapFileDescriptor swap_file;
+HANDLE swap_file;
 std::vector<HANDLE> views;
+std::vector<size_t> view_page_index;
 std::vector<long> views_last_swap;
 HANDLE exception_handler = NULL;
 size_t pages = 0;
@@ -61,9 +69,9 @@ static O1HeapInstance *instance = NULL;
 #define DWORD_HI(x) (x >> 32)
 #define DWORD_LO(x) ((x)&0xffffffff)
 
-size_t inline get_view_to_map(void *address) {
-  return ((unsigned long long)address - (unsigned long long)fmalloced_base) /
-         MAPFILE_PAGE_SIZE;
+size_t inline get_view_to_map(void* address) {
+	return ((unsigned long long)address - (unsigned long long)fmalloced_base) /
+		MAPFILE_PAGE_SIZE;
 }
 
 size_t inline get_view_to_unmap() {
@@ -91,7 +99,7 @@ int fallocate(HANDLE hndl, long long int size_to_reserve) {
   if (!SetFilePointerEx(hndl, zero, &old_pos, FILE_CURRENT))
     return -1;
 
-  // Movie file position to the new end. These calls do NOT result in the actual
+  // Move file position to the new end. These calls do NOT result in the actual
   // allocation of new blocks, but they must succeed.
   LARGE_INTEGER new_pos = {0};
   new_pos.QuadPart = size_to_reserve;
@@ -155,132 +163,173 @@ XBOXFMALLOC_API void fmalloc_close() {
   DeleteCriticalSection(&memory_critical_section);
 }
 
-MapFileDescriptor open_map_file(const char *filepath, size_t max_size) {
-  struct _stat64 st;
+HANDLE open_map_file(const char* filepath, size_t max_size) {
+	struct _stat64 st;
+	std::wstring filepathw(filepath, filepath + strlen(filepath));
+	if (_stat64(filepath, &st) < 0 || st.st_size < max_size) {
+		// try to create it
 
-  if (_stat64(filepath, &st) < 0 || st.st_size < max_size) {
-    // try to create it
-    int fd = _open(filepath, O_RDWR | O_CREAT, 0644);
-    if (fd < 0) {
-      return INVALID_MAPFILE;
-    }
+		HANDLE hFile = CreateFileFromAppW(filepathw.c_str(),		// Name of the file
+			(GENERIC_READ | GENERIC_WRITE),	// Open for writing
+			0,								// Do not share
+			NULL,							// Default security
+			CREATE_ALWAYS,					// Overwrite existing
+			FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING,
+			NULL);
 
-    if (fallocate((HANDLE)_get_osfhandle(fd), max_size) != 0) {
-      return INVALID_MAPFILE;
-    }
-    _close(fd);
+		if (hFile == INVALID_HANDLE_VALUE)
+		{
+			return INVALID_MAPFILE;
+		}
 
-    if (_stat64(filepath, &st) < 0) {
-      return INVALID_MAPFILE;
-    }
-  }
+		if (fallocate(hFile, max_size) != 0) {
+			return INVALID_MAPFILE;
+		}
 
-  int fd = _open(filepath, O_RDWR, 0644);
-  if (fd < 0) {
-    return INVALID_MAPFILE;
-  }
+		CloseHandle(hFile);
 
-  HANDLE section =
-      CreateFileMapping((HANDLE)_get_osfhandle(fd), nullptr, PAGE_READWRITE,
-                        DWORD_HI(max_size), DWORD_LO(max_size), nullptr);
-  if (NULL == section) {
-    return INVALID_MAPFILE;
-  }
-  return {fd, section};
+		if (_stat64(filepath, &st) < 0) {
+			return INVALID_MAPFILE;
+		}
+	}
+
+	HANDLE hFile = CreateFileFromAppW(filepathw.c_str(),		// Name of the file
+		(GENERIC_READ | GENERIC_WRITE),	// Open for writing
+		0,								// Do not share
+		NULL,							// Default security
+		OPEN_EXISTING,					// Overwrite existing
+		FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING,
+		NULL);
+
+	if (hFile == INVALID_HANDLE_VALUE)
+	{
+		return INVALID_MAPFILE;
+	}
+
+	return hFile;
 }
 
-void close_map_file(MapFileDescriptor map_file) {
-  CloseHandle(map_file.mapping_handle);
-  _close(map_file.file_descriptor);
+void close_map_file(HANDLE map_file) {
+	CloseHandle(map_file);
 }
 
-#ifdef _XBOX_UWP
-#define MapFile MapViewOfFile3FromApp
-#else
-#define MapFile MapViewOfFile3
-#endif
-
-#ifdef _XBOX_UWP
-#define VAlloc VirtualAlloc2FromApp
-#else
-#define VAlloc VirtualAlloc2
-#endif
 
 // THE SHADOW!
 // The handler is handled by process, so it's not thread safe
 static LONG CALLBACK
 ShadowExceptionHandler(PEXCEPTION_POINTERS exception_pointers) {
-  void *addr =
-      (void *)(exception_pointers->ExceptionRecord->ExceptionInformation[1]);
+	void* addr =
+		(void*)(exception_pointers->ExceptionRecord->ExceptionInformation[1]);
 
-  size_t view_index = get_view_to_map(addr);
+	size_t page_index = get_view_to_map(addr);
 
-  if (view_index >= pages)
-    return EXCEPTION_CONTINUE_SEARCH;
+	if (page_index >= pages)
+		return EXCEPTION_CONTINUE_SEARCH;
 
-  //We got work to do. Lock
-  EnterCriticalSection(&memory_critical_section);
+	//We got work to do. Lock
+	EnterCriticalSection(&memory_critical_section);
 
-  time += 1;
+	time += 1;
 
-  size_t view_to_swap = get_view_to_unmap();
+	size_t view_to_swap = time % views.size();
+	HANDLE& swap_handle = views[view_to_swap];
+	size_t swap_page_index = view_page_index[view_to_swap];
 
-  HANDLE &swap_handle = views[view_to_swap];
+	OVERLAPPED write_address = { 0 };
+	write_address.Pointer = (VOID*)((char*)0ull + swap_page_index * MAPFILE_PAGE_SIZE);
+	DWORD written = 0;
+	//Save content
+	BOOL bResult = WriteFile(swap_file, swap_handle, MAPFILE_PAGE_SIZE, &written, &write_address);
+	if (!bResult || written != MAPFILE_PAGE_SIZE)
+	{
+		int error = GetLastError();
+		int debug = 0;
+	}
+	//Free old page
+	bResult = VirtualFree(swap_handle, MAPFILE_PAGE_SIZE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+	if (!bResult)
+	{
+		int error = GetLastError();
+		int debug = 0;
+	}
+	//Allocate new page
+	swap_handle = VAlloc(
+		GetCurrentProcess(),
+		(char*)fmalloced_base + page_index * MAPFILE_PAGE_SIZE,
+		MAPFILE_PAGE_SIZE,
+		MEM_COMMIT | MEM_RESERVE | MEM_REPLACE_PLACEHOLDER,
+		PAGE_READWRITE,
+		nullptr,
+		0
+	);
+	if (NULL == swap_handle)
+	{
+		int error = GetLastError();
+		int debug = 0;
+	}
+	//Read page from file into memory
+	OVERLAPPED read_address = { 0 };
+	read_address.Pointer = (VOID*)((char*)0ull + page_index * MAPFILE_PAGE_SIZE);
+	DWORD read = 0;
+	bResult = ReadFile(swap_file, swap_handle, MAPFILE_PAGE_SIZE, &read, &read_address);
+	if (!bResult || read != MAPFILE_PAGE_SIZE)
+	{
+		int error = GetLastError();
+		int debug = 0;
+	}
+	view_page_index[view_to_swap] = page_index;
 
-  UnmapViewOfFile2(GetCurrentProcess(), swap_handle,
-                   MEM_PRESERVE_PLACEHOLDER);
+	LeaveCriticalSection(&memory_critical_section);
 
-  swap_handle = MapFile(swap_file.mapping_handle, nullptr,
-                        (char *)fmalloced_base + view_index * MAPFILE_PAGE_SIZE,
-                        view_index * MAPFILE_PAGE_SIZE, MAPFILE_PAGE_SIZE,
-                        MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE,
-                          nullptr, 0);
-
-  views_last_swap[view_to_swap] = time;
-
-  LeaveCriticalSection(&memory_critical_section);
-
-  return EXCEPTION_CONTINUE_EXECUTION;
+	return EXCEPTION_CONTINUE_EXECUTION;
 }
 
-void nemory_mapping_init(const char *files_prefix, size_t size) {
-  swap_file = open_map_file(files_prefix, size);
 
-  pages = (size / MAPFILE_PAGE_SIZE);
+void nemory_mapping_init(const char* files_prefix, size_t size) {
+	swap_file = open_map_file(files_prefix, size);
 
-  // allocate the whole address space
-  fmalloced_base =
-      VAlloc(nullptr, nullptr, size,
-             MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+	pages = (size / MAPFILE_PAGE_SIZE);
 
-  // split it in file pages
-  for (size_t index = 0; index < pages - 1; ++index) {
-    if (!VirtualFree((char *)fmalloced_base + index * MAPFILE_PAGE_SIZE,
-                     MAPFILE_PAGE_SIZE,
-                     MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
-      int error = GetLastError();
-      fmalloced_base = nullptr;
-    };
-  }
+	// allocate the whole address space
+	fmalloced_base =
+		VAlloc(nullptr, nullptr, size,
+			MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
 
-  size_t pages_to_load = MAPFILE_MAX_LOADED_BYTES / MAPFILE_PAGE_SIZE;
-  views.resize(pages_to_load);
-  views_last_swap.resize(pages_to_load, 0);
+	// split it in file pages
+	for (size_t index = 0; index < pages - 1; ++index) {
+		if (!VirtualFree((char*)fmalloced_base + index * MAPFILE_PAGE_SIZE,
+			MAPFILE_PAGE_SIZE,
+			MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+			int error = GetLastError();
+			fmalloced_base = nullptr;
+		};
+	}
 
-  for (size_t index = 0; index < pages_to_load; ++index) {
-    views[index] = MapFile(swap_file.mapping_handle, nullptr,
-                           (char*)fmalloced_base + index * MAPFILE_PAGE_SIZE,
-                           index * MAPFILE_PAGE_SIZE, MAPFILE_PAGE_SIZE,
-                           MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
-    if (views[index] == NULL)
-    {
-      int error = GetLastError();
-      fmalloced_base = nullptr;
-    }
-  }
+	size_t pages_to_load = MAPFILE_MAX_LOADED_BYTES / MAPFILE_PAGE_SIZE;
+	views.resize(pages_to_load);
+	view_page_index.resize(pages_to_load);
+	views_last_swap.resize(pages_to_load, 0);
 
-  exception_handler =
-      AddVectoredExceptionHandler(TRUE, &ShadowExceptionHandler);
+	for (size_t index = 0; index < pages_to_load; ++index) {
+		views[index] = VAlloc(
+			GetCurrentProcess(),
+			(char*)fmalloced_base + index * MAPFILE_PAGE_SIZE,
+			MAPFILE_PAGE_SIZE,
+			MEM_COMMIT | MEM_RESERVE | MEM_REPLACE_PLACEHOLDER,
+			PAGE_READWRITE,
+			nullptr,
+			0
+		);
+		if (views[index] == NULL)
+		{
+			int error = GetLastError();
+			fmalloced_base = nullptr;
+		}
+		view_page_index[index] = index;
+	}
+
+	exception_handler =
+		AddVectoredExceptionHandler(TRUE, &ShadowExceptionHandler);
 }
 
 void nemory_mapping_deinit() {
